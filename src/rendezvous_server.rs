@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,7 +51,9 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    // The second field is set once the client has completed the secure TCP
+    // key exchange: everything sent to it from then on is encrypted.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -100,7 +102,13 @@ enum LoopFailure {
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
     pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+        // Key pairs are generated per TCP connection (see `send_key_exchange`);
+        // libsodium only guarantees that to be thread-safe after init.
+        sodiumoxide::init().ok();
         let (key, sk) = Self::get_server_sk(key);
+        if !key.is_empty() && sk.is_some() {
+            log::info!("Secure TCP key exchange is offered on tcp :{}", port);
+        }
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
@@ -823,7 +831,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, encrypt) => {
+                        let bytes = match encrypt {
+                            Some(encrypt) => encrypt.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1178,8 +1190,38 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            // Secure TCP: offer a key exchange on accept. A client that wants it
+            // (e.g. one signed in with an access token) answers before sending
+            // anything else, and everything after that is encrypted in both
+            // directions. Other clients skip our message and keep talking in plain.
+            let mut our_sk_b = self.send_key_exchange(&mut sink, key).await;
+            let mut decrypt: Option<Encrypt> = None;
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(decrypt) = decrypt.as_mut() {
+                    if let Err(err) = decrypt.dec(&mut bytes) {
+                        log::warn!("Failed to decrypt tcp message from {:?}: {}", addr, err);
+                        break;
+                    }
+                } else if let Some(our_sk_b) = our_sk_b.take() {
+                    // Only the first message can be the client's answer.
+                    match Self::open_key_exchange(&bytes, &our_sk_b) {
+                        Ok(Some(encrypt)) => {
+                            // One state per direction, each counts its own messages:
+                            // the sink may move to tcp_punch while we keep reading here.
+                            if let Some(Sink::TcpStream(_, sink_encrypt)) = sink.as_mut() {
+                                *sink_encrypt = Some(encrypt.clone());
+                            }
+                            decrypt = Some(encrypt);
+                            continue;
+                        }
+                        Ok(None) => {} // a plain client, the message is handled below
+                        Err(err) => {
+                            log::warn!("Key exchange with {:?} failed: {}", addr, err);
+                            break;
+                        }
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1190,6 +1232,45 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Secure TCP, step 1: send an ephemeral public key signed with the server
+    /// key, so that the client can verify it and seal a symmetric key for it.
+    /// Returns the matching secret key, or `None` if nothing was sent: the
+    /// exchange is only offered when the server enforces a key it can sign with.
+    async fn send_key_exchange(
+        &self,
+        sink: &mut Option<Sink>,
+        key: &str,
+    ) -> Option<box_::SecretKey> {
+        if key.is_empty() {
+            return None;
+        }
+        let sk = self.inner.sk.as_ref()?;
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![sign::sign(&our_pk_b.0, sk).into()],
+            ..Default::default()
+        });
+        Self::send_to_sink(sink, msg_out).await;
+        Some(our_sk_b)
+    }
+
+    /// Secure TCP, step 2: the client answers with its own ephemeral public key
+    /// and a symmetric key sealed for the key pair of step 1.
+    /// Returns `Ok(None)` if `bytes` is not a key exchange message.
+    fn open_key_exchange(bytes: &[u8], our_sk_b: &box_::SecretKey) -> ResultType<Option<Encrypt>> {
+        match RendezvousMessage::parse_from_bytes(bytes).map(|msg_in| msg_in.union) {
+            Ok(Some(rendezvous_message::Union::KeyExchange(ex))) => {
+                if ex.keys.len() != 2 {
+                    bail!("invalid key exchange message");
+                }
+                let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], our_sk_b)?;
+                Ok(Some(Encrypt::new(key)))
+            }
+            _ => Ok(None),
+        }
     }
 
     #[inline]
