@@ -308,7 +308,7 @@ async fn expect_closed(conn: &mut FramedStream, case: &str) -> ResultType<()> {
 }
 
 async fn bad(host: &str, key: &str) -> ResultType<()> {
-    let cases: [(&str, fn(&mut Vec<Bytes>)); 5] = [
+    let cases: [(&str, fn(&mut Vec<Bytes>)); 6] = [
         ("answer with one key", |keys| keys.truncate(1)),
         ("answer with three keys", |keys| {
             keys.push(Bytes::from_static(b"x"))
@@ -318,6 +318,11 @@ async fn bad(host: &str, key: &str) -> ResultType<()> {
         }),
         ("sealed key cut to 10 bytes", |keys| {
             keys[1] = keys[1].slice(..10)
+        }),
+        ("sealed key padded to 64 KiB", |keys| {
+            let mut sealed = keys[1].to_vec();
+            sealed.resize(64 * 1024, 0);
+            keys[1] = sealed.into();
         }),
         ("sealed key that does not open", |keys| {
             let mut sealed = keys[1].to_vec();

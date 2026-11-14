@@ -3,13 +3,15 @@
 # Each instance gets an empty working directory, so it makes its own key pair
 # and database there, and both are deleted afterwards.
 #
-#   secure_tcp_test.sh <patched hbbs> <stock hbbs> <secure_tcp_probe> [address]
+#   secure_tcp_test.sh <patched hbbs> <stock hbbs | -> <secure_tcp_probe> [address]
 #
+# With - in place of the stock hbbs the control run against it is skipped.
 # The address defaults to 127.0.0.1. Given another address of this machine, the
 # nat check also covers the NAT test port, which is the admin console on 127.0.0.1.
 set -u
 PATCHED=$(realpath "$1")
-STOCK=$(realpath "$2")
+STOCK=$2
+[ "$STOCK" = - ] || STOCK=$(realpath "$STOCK")
 PROBE=$(realpath "$3")
 addr=${4:-127.0.0.1}
 # hbbs also reads its options from the environment (KEY, PORT, ...), so the
@@ -79,14 +81,16 @@ check 1 secure "no KeyExchange expected, the probe waits out the client's 18 s R
 check 0 plain "plain request"
 stop_hbbs
 
-echo "===== control: stock 1.1.16 hbbs (-k _ -r <relay>)"
-start_hbbs "$STOCK" -k _ -r 127.0.0.1:21117
-check 1 secure "d: no KeyExchange arrives, the probe waits out the client's 18 s READ_TIMEOUT"
-check 0 plain "baseline: plain request"
-check 0 nat "baseline: NAT type test in plain"
-check 0 ws "baseline: WebSocket port"
-check 0 e2e-plain "baseline: punch hole and relay rounds in plain"
-stop_hbbs
+if [ "$STOCK" != - ]; then
+    echo "===== control: stock 1.1.16 hbbs (-k _ -r <relay>)"
+    start_hbbs "$STOCK" -k _ -r 127.0.0.1:21117
+    check 1 secure "d: no KeyExchange arrives, the probe waits out the client's 18 s READ_TIMEOUT"
+    check 0 plain "baseline: plain request"
+    check 0 nat "baseline: NAT type test in plain"
+    check 0 ws "baseline: WebSocket port"
+    check 0 e2e-plain "baseline: punch hole and relay rounds in plain"
+    stop_hbbs
+fi
 
 if [ "$failed" = 0 ]; then
     echo "ALL CHECKS AS EXPECTED"

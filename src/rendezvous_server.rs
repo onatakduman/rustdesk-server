@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::{box_, sign};
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -1263,7 +1263,13 @@ impl RendezvousServer {
     fn open_key_exchange(bytes: &[u8], our_sk_b: &box_::SecretKey) -> ResultType<Option<Encrypt>> {
         match RendezvousMessage::parse_from_bytes(bytes).map(|msg_in| msg_in.union) {
             Ok(Some(rendezvous_message::Union::KeyExchange(ex))) => {
-                if ex.keys.len() != 2 {
+                // A valid answer is a 32-byte public key and a sealed 32-byte key.
+                // Anything else is refused here, before a buffer of the sender's
+                // choosing is allocated and run through the cipher.
+                if ex.keys.len() != 2
+                    || ex.keys[0].len() != box_::PUBLICKEYBYTES
+                    || ex.keys[1].len() != secretbox::KEYBYTES + box_::MACBYTES
+                {
                     bail!("invalid key exchange message");
                 }
                 let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], our_sk_b)?;
